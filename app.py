@@ -1,167 +1,343 @@
 import streamlit as st
 
+from backend.ai import (
+    generate_reply,
+    AIConfigurationError,
+    AIResponseError,
+)
+from backend.assessment import analyze_conversation, analyze_message
+from backend.chat_safety import (
+    EMERGENCY_MESSAGE,
+    parse_emergency_confirmation,
+)
+from backend.questions import get_next_question
+from backend.response_safety import validate_ai_response
+from frontend.styles import apply_styles
+
+
 st.set_page_config(
-    page_title="FirstAid AI — prototype",
+    page_title="FirstAid AI",
     page_icon="🩹",
     layout="centered",
 )
 
-st.title("🩹 FirstAid AI")
-st.caption("A first-aid guidance prototype — not a diagnosis or a replacement for a healthcare professional.")
 
-st.warning(
-    "If someone is unconscious, having trouble breathing, has severe bleeding, "
-    "or may have a life-threatening injury, call 112 in Romania (or your local emergency number) now. "
-    "Get a trusted adult immediately. Do not wait for this app."
+# -------------------------------
+# VISUAL THEME
+# -------------------------------
+
+apply_styles()
+
+
+# -------------------------------
+# SESSION STATE
+# -------------------------------
+
+DEFAULTS = {
+    "messages": [],
+    "conversation_started": False,
+    "injury_area": "general",
+    "asked_question_ids": [],
+    "current_question_id": None,
+    "emergency_confirmed": False,
+    "awaiting_vision_clarification": False,
+    "ai_retry_pending": False,
+    "ai_response_pending": False,
+    "assessment_notice_shown": False,
+}
+
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# -------------------------------
+# STATIC SAFETY MESSAGES
+# -------------------------------
+
+PROMPT_ASSESSMENT_MESSAGE = (
+    "**Please tell a trusted adult and arrange prompt medical assessment.** "
+    "A chat assistant cannot determine how serious an injury is. "
+    "Stop the activity and do not force movements that cause pain."
 )
+
+ASSESSMENT_STOP_MESSAGE = (
+    "Thanks for answering. Please prioritize getting help from a trusted adult "
+    "and a healthcare professional rather than continuing this chat."
+)
+
+VISION_CLARIFICATION = (
+    "Do you mean **you can't see the injured area**, or that **your eyesight "
+    "itself has suddenly changed**? Please reply `area` or `eyesight`."
+)
+
+
+def add_assistant_message(content: str):
+    st.session_state.messages.append(
+        {"role": "assistant", "content": content}
+    )
+
+
+def add_emergency_message():
+    st.session_state.emergency_confirmed = True
+    st.session_state.ai_retry_pending = False
+    st.session_state.ai_response_pending = False
+    add_assistant_message(EMERGENCY_MESSAGE)
+
+
+def show_assessment_if_needed(urgent_flags):
+    if urgent_flags and not st.session_state.assessment_notice_shown:
+        add_assistant_message(PROMPT_ASSESSMENT_MESSAGE)
+        st.session_state.assessment_notice_shown = True
+
+
+def add_next_question():
+    question = get_next_question(
+        st.session_state.injury_area,
+        set(st.session_state.asked_question_ids),
+    )
+
+    if question is None:
+        st.session_state.current_question_id = None
+        st.session_state.ai_response_pending = True
+        return
+
+    st.session_state.asked_question_ids.append(question["id"])
+    st.session_state.current_question_id = question["id"]
+    add_assistant_message(question["question"])
+
+
+def apply_answer_to_previous_question(question_id, answer):
+    """Interpret yes/no only in the context of the exact question asked."""
+    if answer is None:
+        return
+
+    if question_id in {
+        "leg_weakness",
+        "loss_consciousness",
+    } and answer is True:
+        add_emergency_message()
+        return
+
+    urgent_yes = {
+        "leg_numbness",
+        "head_neck_impact",
+        "knee_swelling",
+        "foot_swelling",
+        "arm_deformity",
+        "arm_sensation",
+        "shoulder_shape",
+        "neurological_symptoms",
+    }
+
+    urgent_no = {
+        "walking_ability",
+        "weight_bearing",
+        "arm_use",
+    }
+
+    if (question_id in urgent_yes and answer is True) or (
+        question_id in urgent_no and answer is False
+    ):
+        show_assessment_if_needed(["concerning_follow_up_answer"])
+
+
+# -------------------------------
+# AI RESPONSE
+# -------------------------------
+
+def respond_with_ai():
+    st.session_state.ai_response_pending = False
+
+    with st.chat_message("assistant"):
+        with st.spinner("Preparing a response..."):
+            try:
+                reply = generate_reply(st.session_state.messages)
+
+                is_valid, validation_reason = validate_ai_response(reply)
+
+                if not is_valid:
+                    print(
+                        "[FirstAid AI] Response rejected by safety check: "
+                        f"{validation_reason}"
+                    )
+                    reply = (
+                        "I can't safely provide a more specific response "
+                        "based on the information collected. Please discuss "
+                        "the injury with a trusted adult and seek medical "
+                        "advice if symptoms are severe, worsening, or limit "
+                        "normal movement."
+                    )
+
+                st.markdown(reply)
+
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": reply}
+                )
+                st.session_state.ai_retry_pending = False
+
+            except AIConfigurationError as error:
+                st.error(f"AI configuration problem: {error}")
+                st.session_state.ai_retry_pending = False
+
+            except AIResponseError:
+                st.error("The AI services are temporarily unavailable.")
+                st.caption(
+                    "Your conversation is saved. You can retry without "
+                    "sending your message again."
+                )
+                st.session_state.ai_retry_pending = True
+
+
+# -------------------------------
+# HEADER
+# -------------------------------
 
 st.markdown(
     """
-This prototype uses a **fixed safety checklist**, not an AI diagnosis. It is deliberately cautious:
-when an answer suggests a potentially serious injury, it recommends getting medical help.
-"""
+    <div class="fa-brand-row">
+        <div class="fa-mark">+</div>
+        <div>
+            <div class="fa-brand-name">FirstAid AI</div>
+            <div class="fa-brand-subtitle">Clear guidance. Safer next steps.</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.header("1. Tell us what happened")
-injury_area = st.selectbox(
-    "Where is the injury?",
-    ["Ankle / foot", "Leg / knee", "Arm / wrist / hand", "Shoulder", "Head / neck / back", "Other"],
-)
-mechanism = st.selectbox(
-    "How did it happen?",
-    [
-        "Twist or awkward landing",
-        "Fall or direct impact",
-        "Collision during sport",
-        "Cut or puncture",
-        "I am not sure",
-        "Something else",
-    ],
-)
-when = st.radio(
-    "When did it happen?",
-    ["Just now", "Within the last 24 hours", "More than 24 hours ago"],
-)
-
-st.header("2. What are you experiencing?")
-st.caption("Choose every option that applies. If you are unsure, choose the safer / more urgent option.")
-
-red_flags = {
-    "Severe bleeding that will not stop": False,
-    "Bone visible through a wound": False,
-    "The injured limb or joint looks badly deformed or is at an unusual angle": False,
-    "Fingers or toes are blue, very pale, cold, or numb": False,
-    "Unconsciousness, confusion, seizure, or difficulty staying awake": False,
-    "Trouble breathing or chest pain": False,
-    "Serious head, neck, or back injury": False,
-}
-
-urgent_flags = {
-    "I cannot use the injured limb normally": False,
-    "I cannot put weight on the injured foot or leg": False,
-    "Pain is severe or getting worse": False,
-    "There is a lot of swelling or bruising": False,
-    "Movement is very limited": False,
-    "There is an open wound (but not severe bleeding)": False,
-}
-
-selected_red = []
-selected_urgent = []
-
-left, right = st.columns(2)
-with left:
-    st.subheader("Emergency warning signs")
-    for label in red_flags:
-        if st.checkbox(label, key=f"red_{label}"):
-            selected_red.append(label)
-
-with right:
-    st.subheader("Needs prompt medical assessment")
-    for label in urgent_flags:
-        if st.checkbox(label, key=f"urgent_{label}"):
-            selected_urgent.append(label)
-
-pain_level = st.select_slider(
-    "How strong is the pain?",
-    options=["No pain", "Mild", "Moderate", "Severe"],
-    value="Mild",
-)
-extra = st.text_area(
-    "Anything else you want to mention? (Optional)",
-    placeholder="Describe symptoms in your own words. Do not include your full name, address, or other identifying details.",
-)
-
-st.header("3. Get guidance")
-
-if st.button("Assess urgency", type="primary", use_container_width=True):
-    st.divider()
-
-    if selected_red:
-        st.error("EMERGENCY — get help now")
-        st.markdown(
-            """
-**Call 112 in Romania now**, or ask someone nearby to call. Get a trusted adult immediately.
-
-- Do not wait for an online assessment or keep chatting with the app.
-- Avoid moving the injured area unnecessarily.
-- Do not try to straighten a deformed limb, put a joint back in place, or push a visible bone back in.
-- Follow the emergency operator's instructions.
-"""
-        )
-        st.caption("This result is triggered by the warning signs you selected.")
-
-    elif selected_urgent or pain_level == "Severe":
-        st.warning("PROMPT MEDICAL ASSESSMENT — involve an adult and get checked")
-        st.markdown(
-            """
-Your answers include symptoms that can occur with injuries needing professional assessment.
-A sprain, fracture, or dislocation can be difficult to distinguish without an examination.
-
-**What to do while arranging help:**
-- Stop the activity and avoid putting weight on or using the injured part.
-- Keep it supported in the position that feels most comfortable.
-- A cold pack wrapped in a towel may help with pain and swelling. Never put ice directly on skin.
-- Do not attempt to straighten the limb or put a joint back in place.
-- Tell a parent, guardian, school nurse, teacher, or another trusted adult and arrange medical assessment promptly.
-
-If the area becomes blue, pale, cold or numb, the injury becomes deformed, or the person becomes very unwell, call 112.
-"""
-        )
-    else:
-        st.info("LOWER URGENCY BASED ON THE ANSWERS — keep monitoring")
-        st.markdown(
-            """
-Your answers did not select one of this prototype's urgent warning signs. That **does not rule out**
-a fracture or another injury.
-
-- Stop activities that cause pain and rest the injured area.
-- A cold pack wrapped in a towel may help with discomfort or swelling. Never put ice directly on skin.
-- Tell a trusted adult what happened.
-- Get medical advice if pain, swelling, bruising, or difficulty using the area develops, persists, or gets worse.
-
-If you are worried, unsure, or the injury feels more serious than these questions capture, choose medical assessment.
-"""
-        )
-
-    st.divider()
-    st.subheader("A note about privacy")
-    st.write(
-        "This prototype does not save your answers or send them to an AI service. "
-        "Avoid entering identifying details."
+if not st.session_state.conversation_started:
+    st.markdown(
+        '<div class="fa-eyebrow"><span class="fa-eyebrow-dot"></span> First-aid companion</div>',
+        unsafe_allow_html=True,
     )
+    st.title("What's bothering you?")
+    st.markdown(
+        '<div class="fa-intro">Tell me what happened. I’ll help you think through the next safe step, one question at a time.</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.title("Your conversation")
+
+st.markdown(
+    '<div class="fa-safety-note"><span>✳</span><span><strong>Need emergency help?</strong> Call 112 in Romania. Don’t wait for a response from this app.</span></div>',
+    unsafe_allow_html=True,
+)
+
+
+# -------------------------------
+# DISPLAY CHAT HISTORY
+# -------------------------------
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# -------------------------------
+# PROCESS PENDING AI RESPONSE
+# -------------------------------
+
+if st.session_state.ai_response_pending:
+    respond_with_ai()
+
+
+# -------------------------------
+# RETRY
+# -------------------------------
+
+if st.session_state.ai_retry_pending and not st.session_state.emergency_confirmed:
+    if st.button("Retry response", type="primary", use_container_width=True):
+        st.session_state.ai_retry_pending = False
+        st.session_state.ai_response_pending = True
+        st.rerun()
+
+
+# -------------------------------
+# USER INPUT
+# -------------------------------
+
+if not st.session_state.emergency_confirmed:
+    prompt = st.chat_input(
+        "Describe what's happening..."
+        if not st.session_state.conversation_started
+        else "Reply here..."
+    )
+
+    if prompt:
+        previous_question_id = st.session_state.current_question_id
+
+        st.session_state.messages.append(
+            {"role": "user", "content": prompt}
+        )
+
+        latest = analyze_message(prompt)
+        conversation = analyze_conversation(st.session_state.messages)
+
+        if not st.session_state.conversation_started:
+            st.session_state.conversation_started = True
+            st.session_state.injury_area = latest["injury_area"]
+        elif (
+            st.session_state.injury_area == "general"
+            and latest["injury_area"] != "general"
+        ):
+            st.session_state.injury_area = latest["injury_area"]
+
+        # Scan every new message and retain earlier warning signs.
+        if conversation["emergency_flags"]:
+            add_emergency_message()
+
+        # "I can't see" is ambiguous. Clarify instead of interpreting it as yes/no.
+        elif latest["ambiguous_vision"] and not st.session_state.awaiting_vision_clarification:
+            st.session_state.awaiting_vision_clarification = True
+            add_assistant_message(VISION_CLARIFICATION)
+
+        elif st.session_state.awaiting_vision_clarification:
+            lower = prompt.lower()
+
+            if "eyesight" in lower or "vision" in lower:
+                st.session_state.awaiting_vision_clarification = False
+                add_emergency_message()
+            elif "area" in lower or "injury" in lower or "body" in lower:
+                st.session_state.awaiting_vision_clarification = False
+                if st.session_state.assessment_notice_shown:
+                    add_assistant_message(ASSESSMENT_STOP_MESSAGE)
+                else:
+                    add_next_question()
+            else:
+                add_assistant_message(
+                    "Please choose one: `area` if you cannot see the injured "
+                    "body part, or `eyesight` if your vision itself has changed."
+                )
+
+        else:
+            st.session_state.current_question_id = None
+
+            answer = parse_emergency_confirmation(prompt)
+            apply_answer_to_previous_question(previous_question_id, answer)
+
+            if not st.session_state.emergency_confirmed:
+                show_assessment_if_needed(conversation["urgent_flags"])
+
+                # Once a concerning injury has been identified, ask at most
+                # one focused safety question and then stop the chat flow.
+                if (
+                    st.session_state.assessment_notice_shown
+                    and previous_question_id is not None
+                ):
+                    add_assistant_message(ASSESSMENT_STOP_MESSAGE)
+                else:
+                    add_next_question()
+
+        st.rerun()
+
+
+# -------------------------------
+# FOOTER
+# -------------------------------
 
 st.markdown("---")
 st.caption(
-    "Prototype only. Not for diagnosis, treatment decisions, or emergencies. "
-    "The checklist is incomplete and must be reviewed by qualified medical professionals before real-world use."
+    "Prototype only. This tool does not diagnose injuries or rule out serious "
+    "conditions. It is not a substitute for professional medical care."
 )
-
-with st.expander("Sources used to shape this prototype"):
-    st.markdown(
-        """
-- [American Heart Association / American Red Cross — 2024 First Aid Guidelines](https://cpr.heart.org/en/resuscitation-science/2024-first-aid-guidelines)
-- [NHS — Broken ankle](https://www.nhs.uk/conditions/broken-ankle/)
-- [British Red Cross — Broken bones and fractures](https://www.redcross.org.uk/first-aid/learn-first-aid/broken-bone)
-- [WHO — Ethics and governance of AI for health](https://www.who.int/publications/i/item/9789240084759)
-"""
-    )

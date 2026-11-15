@@ -1,0 +1,1 @@
+"""FirstAid AI backend package."""
